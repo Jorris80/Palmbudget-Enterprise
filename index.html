@@ -426,7 +426,7 @@ const LS = safeStore("localStorage"), SSN = safeStore("sessionStorage");
 
 const APP = {
  name: "PalmBudget Enterprise",
- version: "1.0.7",
+ version: "1.0.8",
  build: "2026.11.05"
 };
 
@@ -739,9 +739,121 @@ const saveCache = debounce(() => {
  });
 }, 400);
 
+function normApi(u) {
+ u = String(u || "").trim().split("#")[0].split("?")[0];
+ return u.replace(new RegExp("/u/[0-9]+/"), "/").replace(new RegExp("/+$"), "");
+}
+
+function jsonpPing(url, ms) {
+ return new Promise((res, rej) => {
+  const cb = "__pbeJ" + Date.now(), s = document.createElement("script");
+  const clean = () => {
+   clearTimeout(t);
+   try {
+    delete window[cb];
+   } catch (e) {
+    window[cb] = undefined;
+   }
+   s.remove();
+  };
+  const t = setTimeout(() => {
+   clean();
+   rej(new Error("timeout"));
+  }, ms || 12e3);
+  window[cb] = d => {
+   clean();
+   res(d);
+  };
+  s.onerror = () => {
+   clean();
+   rej(new Error("gagal memuat"));
+  };
+  s.src = url + "?action=app.ping&callback=" + cb + "&t=" + Date.now();
+  document.head.appendChild(s);
+ });
+}
+
+async function diagnoseApi(raw) {
+ const url = normApi(raw);
+ const tips = [];
+ if (!url) return {
+  ok: false,
+  msg: "URL kosong."
+ };
+ if (String(raw).indexOf("/u/") > 0) tips.push("URL berisi /u/N/ (multi-akun Google) - sudah dirapikan otomatis.");
+ if (url.indexOf("https:") !== 0 && !okApiUrl(url)) return {
+  ok: false,
+  url,
+  msg: "URL harus diawali https:"
+ };
+ if (url.slice(-4) === "/dev") return {
+  ok: false,
+  url,
+  msg: "Ini URL uji (/dev) yang hanya bisa dibuka pemilik skrip. Pakai URL Web App yang berakhiran /exec (Deploy > Manage deployments)."
+ };
+ if (url.slice(-5) !== "/exec") return {
+  ok: false,
+  url,
+  msg: "URL harus berakhiran /exec (salin dari Deploy > Manage deployments > Web app URL)."
+ };
+ try {
+  const r = await fetch(url, {
+   method: "POST",
+   body: JSON.stringify({
+    action: "app.ping",
+    data: {}
+   }),
+   headers: {
+    "Content-Type": "text/plain;charset=utf-8"
+   },
+   redirect: "follow"
+  });
+  const txt = await r.text();
+  let j = null;
+  try {
+   j = JSON.parse(txt);
+  } catch (e) {}
+  if (j && j.ok) return {
+   ok: true,
+   url,
+   msg: "Terhubung ke server v" + j.data.version + ".",
+   tips
+  };
+  if (/<html|<!DOCTYPE/i.test(txt)) return {
+   ok: false,
+   url,
+   msg: "Server mengembalikan halaman HTML, bukan data. Biasanya deployment meminta login Google atau skrip error. Pastikan Who has access = Anyone (Siapa saja), lalu buat versi deployment baru.",
+   tips
+  };
+  return {
+   ok: false,
+   url,
+   msg: "Respons server tidak dikenali (HTTP " + r.status + ").",
+   tips
+  };
+ } catch (e) {
+  try {
+   const p = await jsonpPing(url);
+   return {
+    ok: false,
+    url,
+    msg: "Server aktif (v" + (p.data ? p.data.version : "?") + ") tetapi permintaan POST diblokir oleh browser/jaringan (ekstensi pemblokir, VPN, atau proxy kantor). Coba jaringan lain atau nonaktifkan pemblokir.",
+    tips
+   };
+  } catch (e2) {
+   return {
+    ok: false,
+    url,
+    msg: 'Server tidak dapat diakses tanpa login Google. Di Apps Script: Deploy > Manage deployments > Edit (ikon pensil) > Execute as: Me, Who has access: Anyone (Siapa saja) - BUKAN "Anyone with Google account" > Version: New version > Deploy. Lalu salin ulang URL /exec.',
+    tips
+   };
+  }
+ }
+}
+
 const API = {
  isGas: () => !!(window.google && google.script && google.script.run),
- url: () => (LS.getItem("pbe_api") || window.PBE_API_URL || "").trim(),
+ url: () => normApi(LS.getItem("pbe_api") || window.PBE_API_URL || ""),
  call(action, data = {}, timeout = 6e4) {
   const req = JSON.stringify({
    action,
@@ -783,7 +895,7 @@ const API = {
    if (!r.ok) throw new Error("HTTP " + r.status);
    return r.json();
   }).catch(e => {
-   const er = new Error(e.name === "AbortError" ? "Waktu koneksi habis." : "Tidak dapat terhubung ke server.");
+   const er = new Error(e.name === "AbortError" ? "Waktu koneksi habis." : navigator.onLine ? 'Tidak dapat terhubung ke server. Buka "Server" di layar login lalu tekan "Uji koneksi" untuk melihat penyebabnya.' : "Perangkat sedang offline.");
    er.network = true;
    throw er;
   }).finally(() => clearTimeout(to));
@@ -1448,6 +1560,7 @@ async function boot() {
  initZoomer();
  bindLogin();
  bindShell();
+ histInit();
  let pub = null;
  try {
   pub = JSON.parse(LS.getItem("pbe_public") || "null");
@@ -1650,6 +1763,17 @@ function bindLogin() {
   } catch (ex) {
    err.textContent = ex.message;
    err.classList.remove("hidden");
+   if (ex.network && !API.isGas() && navigator.onLine) {
+    const a = document.createElement("a");
+    a.href = "#";
+    a.textContent = " Diagnosa koneksi";
+    a.style.fontWeight = "700";
+    a.onclick = ev => {
+     ev.preventDefault();
+     serverModal(true);
+    };
+    err.appendChild(a);
+   }
   } finally {
    btn.disabled = false;
    btn.textContent = "Masuk";
@@ -2004,25 +2128,28 @@ function syncModal() {
  });
 }
 
-function serverModal() {
+function serverModal(autoTest) {
  const m = Modal.open({
   title: "Pengaturan Server",
-  body: `\n    <div class="small muted" style="margin-bottom:10px">${API.isGas() ? "Aplikasi berjalan langsung di Google Apps Script \u2014 tidak perlu URL." : 'Tempel URL Web App Apps Script (diakhiri <span class="mono">/exec</span>) dari menu spreadsheet <b>PalmBudget \u2192 Tampilkan URL Aplikasi</b>.'}</div>\n    <div class="fld"><label>URL Web App</label><input class="inp mono" id="svUrl" placeholder="https:/\/script.google.com/macros/s/.../exec" value="${esc(API.url())}" ${API.isGas() ? "disabled" : ""}></div>\n    <div id="svRes" class="small" style="margin-top:10px"></div>`,
+  body: `\n    <div class="small muted" style="margin-bottom:10px">${API.isGas() ? "Aplikasi berjalan langsung di Google Apps Script \u2014 tidak perlu URL." : 'Tempel URL Web App Apps Script (diakhiri <span class="mono">/exec</span>) dari menu spreadsheet <b>PalmBudget \u2192 Tampilkan URL Aplikasi</b>.'}</div>\n    <div class="fld"><label>URL Web App</label><input class="inp mono" id="svUrl" placeholder="https:/\/script.google.com/macros/s/.../exec" value="${esc(API.url())}" ${API.isGas() ? "disabled" : ""}></div>\n    <div class="tiny muted" style="margin-top:8px">Syarat: deployment Web App dengan <b>Execute as: Me</b> dan <b>Who has access: Anyone</b> (Siapa saja). Gunakan URL berakhiran <span class="mono">/exec</span>.</div>\n    <div id="svRes" class="small" style="margin-top:10px"></div>`,
   foot: `<button class="btn" id="svTest">Uji koneksi</button><button class="btn pri" id="svSave">Simpan</button>`
  });
  $("#svTest", m.el).onclick = e => busy(e.currentTarget, async () => {
-  const old = LS.getItem("pbe_api");
-  LS.setItem("pbe_api", $("#svUrl", m.el).value.trim());
-  try {
-   const p = await rpc("app.ping", {}, 15e3);
-   $("#svRes", m.el).innerHTML = `<span class="chip f-NORMAL">Terhubung</span> server v${esc(p.version)} \xb7 ${esc(p.time)}`;
-  } catch (x) {
-   $("#svRes", m.el).innerHTML = `<span class="chip f-OVER">Gagal</span> ${esc(x.message)}`;
-   if (old !== null) LS.setItem("pbe_api", old); else LS.removeItem("pbe_api");
+  $("#svRes", m.el).innerHTML = '<span class="chip">Menguji...</span>';
+  const d = await diagnoseApi($("#svUrl", m.el).value);
+  if (d.url) $("#svUrl", m.el).value = d.url;
+  $("#svRes", m.el).innerHTML = `<div class="alert ${d.ok ? "o" : "e"}" style="margin-top:6px"><div><b>${d.ok ? "Berhasil" : "Gagal"}</b> - ${esc(d.msg)}${(d.tips || []).map(t => '<div class="tiny">' + esc(t) + "</div>").join("")}</div></div>`;
+  if (d.ok) {
+   LS.setItem("pbe_api", d.url);
+   fetchPublic();
   }
  });
+ if (autoTest && API.url()) setTimeout(() => {
+  const b = $("#svTest", m.el);
+  if (b) b.click();
+ }, 50);
  $("#svSave", m.el).onclick = () => {
-  const v = $("#svUrl", m.el).value.trim();
+  const v = normApi($("#svUrl", m.el).value);
   if (v && !okApiUrl(v)) {
    toast("URL harus berupa URL Web App script.google.com", "e");
    return;
