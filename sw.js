@@ -1,5 +1,5 @@
 /* PalmBudget Enterprise — Service Worker (offline-first) v1.0.0 */
-const VERSION = '1.0.8-2026.11.05';
+const VERSION = '1.0.9-2026.11.05';
 const SHELL_CACHE = 'pbe-shell-' + VERSION;
 const LIB_CACHE = 'pbe-lib-v1';
 const TILE_CACHE = 'pbe-tiles-v1';

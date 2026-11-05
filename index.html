@@ -426,7 +426,7 @@ const LS = safeStore("localStorage"), SSN = safeStore("sessionStorage");
 
 const APP = {
  name: "PalmBudget Enterprise",
- version: "1.0.8",
+ version: "1.0.9",
  build: "2026.11.05"
 };
 
@@ -813,12 +813,15 @@ async function diagnoseApi(raw) {
   try {
    j = JSON.parse(txt);
   } catch (e) {}
-  if (j && j.ok) return {
-   ok: true,
-   url,
-   msg: "Terhubung ke server v" + j.data.version + ".",
-   tips
-  };
+  if (j && j.ok) {
+   LS.removeItem("pbe_transport");
+   return {
+    ok: true,
+    url,
+    msg: "Terhubung ke server v" + j.data.version + ".",
+    tips
+   };
+  }
   if (/<html|<!DOCTYPE/i.test(txt)) return {
    ok: false,
    url,
@@ -834,10 +837,32 @@ async function diagnoseApi(raw) {
  } catch (e) {
   try {
    const p = await jsonpPing(url);
+   const prev = LS.getItem("pbe_api");
+   LS.setItem("pbe_api", url);
+   try {
+    const r2 = await API.jsonpSend({
+     action: "rpc",
+     q: JSON.stringify({
+      action: "app.ping",
+      data: {}
+     })
+    }, 2e4);
+    if (r2 && r2.ok) {
+     LS.setItem("pbe_transport", "jsonp");
+     return {
+      ok: true,
+      url,
+      msg: "Terhubung ke server v" + (p.data ? p.data.version : "?") + " lewat jalur alternatif (GET). Permintaan POST diblokir oleh jaringan/browser Anda; aplikasi akan memakai jalur ini otomatis.",
+      tips
+     };
+    }
+   } catch (e3) {} finally {
+    if (prev !== null) LS.setItem("pbe_api", prev); else LS.removeItem("pbe_api");
+   }
    return {
     ok: false,
     url,
-    msg: "Server aktif (v" + (p.data ? p.data.version : "?") + ") tetapi permintaan POST diblokir oleh browser/jaringan (ekstensi pemblokir, VPN, atau proxy kantor). Coba jaringan lain atau nonaktifkan pemblokir.",
+    msg: "Server aktif (v" + (p.data ? p.data.version : "?") + ") tetapi permintaan POST diblokir dan jalur alternatif belum tersedia di server. Perbarui Code.gs ke versi 1.0.9 lalu deploy versi baru.",
     tips
    };
   } catch (e2) {
@@ -877,10 +902,18 @@ const API = {
   }
   const url = API.url();
   if (!url) {
-   const e = new Error("URL server Apps Script belum diatur. Buka \u2699 Server di layar login.");
+   const e = new Error("URL server Apps Script belum diatur. Buka Server di layar login.");
    e.config = true;
    return Promise.reject(e);
   }
+  const netErr = e => {
+   const er = new Error(e && e.name === "AbortError" ? "Waktu koneksi habis." : navigator.onLine ? 'Tidak dapat terhubung ke server. Buka "Server" di layar login lalu tekan "Uji koneksi" untuk melihat penyebabnya.' : "Perangkat sedang offline.");
+   er.network = true;
+   return er;
+  };
+  if (LS.getItem("pbe_transport") === "jsonp") return API.jsonp(req, timeout).catch(e => {
+   throw netErr(e);
+  });
   const ctl = new AbortController;
   const to = setTimeout(() => ctl.abort(), timeout);
   return fetch(url, {
@@ -895,10 +928,62 @@ const API = {
    if (!r.ok) throw new Error("HTTP " + r.status);
    return r.json();
   }).catch(e => {
-   const er = new Error(e.name === "AbortError" ? "Waktu koneksi habis." : navigator.onLine ? 'Tidak dapat terhubung ke server. Buka "Server" di layar login lalu tekan "Uji koneksi" untuk melihat penyebabnya.' : "Perangkat sedang offline.");
-   er.network = true;
-   throw er;
+   if (e.name === "AbortError" || !navigator.onLine) throw netErr(e);
+   return API.jsonp(req, timeout).then(r => {
+    LS.setItem("pbe_transport", "jsonp");
+    return r;
+   }, () => {
+    throw netErr(e);
+   });
   }).finally(() => clearTimeout(to));
+ },
+ jsonpSend(params, timeout) {
+  return new Promise((res, rej) => {
+   const cb = "__pbeR" + Date.now() + Math.floor(Math.random() * 1e6), s = document.createElement("script");
+   const clean = () => {
+    clearTimeout(t);
+    try {
+     delete window[cb];
+    } catch (e) {
+     window[cb] = undefined;
+    }
+    s.remove();
+   };
+   const t = setTimeout(() => {
+    clean();
+    rej(new Error("timeout"));
+   }, timeout || 6e4);
+   window[cb] = d => {
+    clean();
+    res(d);
+   };
+   s.onerror = () => {
+    clean();
+    rej(new Error("gagal memuat"));
+   };
+   s.src = API.url() + "?" + Object.keys(params).map(k => k + "=" + encodeURIComponent(params[k])).join("&") + "&callback=" + cb;
+   document.head.appendChild(s);
+  });
+ },
+ async jsonp(req, timeout) {
+  const max = 3500;
+  if (req.length <= max) return API.jsonpSend({
+   action: "rpc",
+   q: req
+  }, timeout);
+  const id = uid("U"), n = Math.ceil(req.length / max);
+  let r = null;
+  for (let i = 0; i < n; i++) {
+   r = await API.jsonpSend({
+    action: "rpc",
+    uid: id,
+    part: i,
+    parts: n,
+    q: req.slice(i * max, (i + 1) * max)
+   }, timeout);
+   if (r && r.ok === false) return r;
+  }
+  return r;
  }
 };
 
